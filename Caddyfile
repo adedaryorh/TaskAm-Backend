@@ -1,0 +1,9 @@
+# Caddy automatically provisions and renews a TLS certificate for DOMAIN via
+# Let's Encrypt, then reverse-proxies to the app container.
+#
+# Set the real domain via an environment variable before starting Caddy, or
+# just replace {$DOMAIN} below with your literal domain.
+
+{$DOMAIN} {
+	reverse_proxy app:8000
+}

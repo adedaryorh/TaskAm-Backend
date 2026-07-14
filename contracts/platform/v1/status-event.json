@@ -1,0 +1,1 @@
+{"event_id":"01900000-0000-7000-8000-000000000003","event_type":"logistics.delivery.status_changed","occurred_at":"2026-07-14T12:00:00Z","source":"logistics","platform_user_id":"usr_farm_01","farmsense_request_id":"fs_req_01","marketplace_request_id":"tam_req_01","logistics_delivery_id":"01900000-0000-7000-8000-000000000002","data":{"status":"provider_assigned"}}

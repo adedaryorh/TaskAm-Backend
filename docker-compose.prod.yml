@@ -1,0 +1,112 @@
+# Production deployment for a single VM (Render, Railway, a bare Ubuntu box,
+# etc). Differences from docker-compose.yml (dev):
+#   - no bind-mounted source (runs the image as built, not live-reloaded)
+#   - gunicorn (multi-worker) instead of --reload uvicorn
+#   - Caddy in front for automatic HTTPS (set DOMAIN in .env)
+#   - restart: unless-stopped on every long-running service
+#
+# Usage:
+#   cp .env.example .env   # fill in real secrets + DOMAIN
+#   docker compose -f docker-compose.prod.yml up -d --build
+#   docker compose -f docker-compose.prod.yml exec app alembic upgrade head
+
+services:
+  app:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    expose:
+      - "8000"
+
+  worker:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    command: python -m app.workers.whatsapp_worker
+
+  ai_worker:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    command: python -m app.workers.ai_parse_worker
+
+  notification_worker:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+    command: python -m app.workers.notification_worker
+
+  outbound_webhook_worker:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      - db
+    restart: unless-stopped
+    command: python -m app.workers.outbound_webhook_worker
+
+  backup:
+    image: postgres:16-alpine
+    env_file:
+      - .env
+    depends_on:
+      - db
+    restart: unless-stopped
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup-loop.sh:/backup-loop.sh:ro
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-taskam}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    command: sh /backup-loop.sh
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: taskam
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taskam}
+      POSTGRES_DB: taskam
+    restart: unless-stopped
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  pgdata:
+  redisdata:
+  caddy_data:
+  caddy_config:
