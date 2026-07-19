@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user
+from app.core.rate_limit import enforce_auth_rate_limit
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.auth import (
@@ -22,23 +23,26 @@ from app.models.user import Student, ProviderProfile
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+# Credential endpoints share one strict per-IP limiter (brute-force / stuffing guard).
+_rate_limited = Depends(enforce_auth_rate_limit)
 
-@router.post("/signup/merchant", response_model=TokenResponse, status_code=201)
+
+@router.post("/signup/merchant", response_model=TokenResponse, status_code=201, dependencies=[_rate_limited])
 def signup_merchant(payload: MerchantSignupRequest, db: Session = Depends(get_db)):
     return auth_service.signup_merchant(db, payload)
 
 
-@router.post("/signup/student", response_model=TokenResponse, status_code=201)
+@router.post("/signup/student", response_model=TokenResponse, status_code=201, dependencies=[_rate_limited])
 def signup_student(payload: StudentSignupRequest, db: Session = Depends(get_db)):
     return auth_service.signup_student(db, payload)
 
 
-@router.post("/signup/service-provider", response_model=TokenResponse, status_code=201)
+@router.post("/signup/service-provider", response_model=TokenResponse, status_code=201, dependencies=[_rate_limited])
 def signup_service_provider(payload: ServiceProviderSignupRequest, db: Session = Depends(get_db)):
     return auth_service.signup_service_provider(db, payload)
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login", response_model=TokenResponse, dependencies=[_rate_limited])
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
     return auth_service.login(db, payload)
 
@@ -48,13 +52,13 @@ def me(current_user: User = Depends(get_current_user)):
     return current_user
 
 
-@router.post("/claim-merchant/request", status_code=202)
+@router.post("/claim-merchant/request", status_code=202, dependencies=[_rate_limited])
 def request_merchant_account_claim(payload: MerchantClaimRequest, db: Session = Depends(get_db)):
     auth_service.request_merchant_claim(db, payload.phone_number)
     return {"detail": "If the account is eligible, a code was sent by WhatsApp"}
 
 
-@router.post("/claim-merchant/complete", response_model=TokenResponse)
+@router.post("/claim-merchant/complete", response_model=TokenResponse, dependencies=[_rate_limited])
 def complete_merchant_account_claim(payload: MerchantClaimCompleteRequest, db: Session = Depends(get_db)):
     return auth_service.complete_merchant_claim(db, payload)
 

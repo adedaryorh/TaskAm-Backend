@@ -75,7 +75,9 @@ def initialize_transaction(reference: str, amount_naira: float, email: str, curr
 
 
 def verify_webhook_signature(raw_body: bytes, signature_header: str | None) -> bool:
-    if not signature_header:
+    # Fail closed: with no secret configured, an attacker could otherwise
+    # "verify" by signing with the empty key.
+    if not settings.paystack_secret_key or not signature_header:
         return False
     computed = hmac.new(settings.paystack_secret_key.encode(), raw_body, hashlib.sha512).hexdigest()
     return hmac.compare_digest(computed, signature_header)

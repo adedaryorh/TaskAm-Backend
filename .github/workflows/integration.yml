@@ -44,6 +44,6 @@ jobs:
       - name: Apply migrations to PostgreSQL
         run: |
           alembic upgrade head
-          test "$(alembic current | awk '{print $1}')" = "4a7b82c3d5e6"
+          test "$(alembic current | awk '{print $1}')" = "b1d4e6f8a2c3"
       - name: Run contract and application tests
         run: pytest -q

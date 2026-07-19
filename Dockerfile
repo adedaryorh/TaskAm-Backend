@@ -1,15 +1,20 @@
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
+# psycopg ships binary wheels, so no compiler toolchain is needed;
+# curl stays for the container healthcheck.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libpq-dev curl \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+
+RUN useradd --create-home appuser
+USER appuser
 
 EXPOSE 8000
 

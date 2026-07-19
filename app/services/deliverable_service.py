@@ -3,7 +3,7 @@ import uuid
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.models.base import TaskStatus, PaymentStatus
+from app.models.base import TaskStatus, PaymentStatus, ClaimStatus
 from app.models.deliverable import Deliverable
 from app.models.payment import Payment
 from app.models.task import Task
@@ -14,7 +14,7 @@ from app.services.task_service import transition_task
 
 
 def get_active_claim_or_403(db: Session, task: Task, provider_user_id: uuid.UUID) -> TaskClaim:
-    claim = db.query(TaskClaim).filter(TaskClaim.task_id == task.id, TaskClaim.status == "ACTIVE").first()
+    claim = db.query(TaskClaim).filter(TaskClaim.task_id == task.id, TaskClaim.status == ClaimStatus.ACTIVE).first()
     if claim is None or claim.provider_user_id != provider_user_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You did not claim this task")
     return claim
@@ -30,6 +30,11 @@ def start_work(db: Session, task: Task, provider_user_id: uuid.UUID) -> Task:
 def request_presigned_upload(task: Task, provider_user_id: uuid.UUID, content_type: str, file_type: str) -> dict:
     from app.core.config import settings
 
+    if task.status != TaskStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Task must be IN_PROGRESS to upload deliverables (status={task.status.value})",
+        )
     key = f"deliverables/{task.id}/{uuid.uuid4()}"
     url = generate_presigned_put_url(key, content_type)
     return {"upload_url": url, "storage_key": key, "expires_in": settings.presigned_url_expiry}
@@ -54,6 +59,10 @@ def register_deliverable(
         )
     if not storage_key and not external_link:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Provide a storage_key or external_link")
+    # Keys are minted by request_presigned_upload under this task's prefix;
+    # anything else could point at another task's (or arbitrary) objects.
+    if storage_key and not storage_key.startswith(f"deliverables/{task.id}/"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="storage_key does not belong to this task")
 
     deliverable = Deliverable(
         task_id=task.id,
@@ -105,7 +114,7 @@ def approve_task(db: Session, task: Task, merchant_id: uuid.UUID) -> Task:
 
     db.commit()
 
-    claim = db.query(TaskClaim).filter(TaskClaim.task_id == task.id, TaskClaim.status == "COMPLETED").first()
+    claim = db.query(TaskClaim).filter(TaskClaim.task_id == task.id, TaskClaim.status == ClaimStatus.COMPLETED).first()
     if claim is not None:
         notify(
             db,

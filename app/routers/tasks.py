@@ -1,12 +1,13 @@
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.deps import require_roles, get_current_user
 from app.db.session import get_db
 from app.models.base import UserRole
 from app.models.task import Task
+from app.models.task_claim import TaskClaim
 from app.models.user import Merchant, User
 from app.schemas.task import TaskResponse
 from app.services.task_service import confirm_task, cancel_task, InvalidTaskTransition
@@ -30,13 +31,22 @@ def _get_owned_task(db: Session, task_id: uuid.UUID, user: User) -> Task:
 
 @router.get("/mine", response_model=list[TaskResponse])
 def list_my_tasks(
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     current_user: User = Depends(require_roles(UserRole.MERCHANT)),
     db: Session = Depends(get_db),
 ):
     merchant = db.query(Merchant).filter(Merchant.user_id == current_user.id).first()
     if merchant is None:
         return []
-    return db.query(Task).filter(Task.merchant_id == merchant.id).order_by(Task.created_at.desc()).all()
+    return (
+        db.query(Task)
+        .filter(Task.merchant_id == merchant.id)
+        .order_by(Task.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
 
 
 @router.get("/{task_id}", response_model=TaskResponse)
@@ -45,7 +55,28 @@ def get_task(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    return _get_owned_task(db, task_id, current_user)
+    task = db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+    if current_user.role == UserRole.ADMIN:
+        return task
+
+    # Owning merchant can view.
+    merchant = db.query(Merchant).filter(Merchant.user_id == current_user.id).first()
+    if merchant is not None and task.merchant_id == merchant.id:
+        return task
+
+    # So can anyone with a claim on the task (active or completed).
+    claim = (
+        db.query(TaskClaim)
+        .filter(TaskClaim.task_id == task.id, TaskClaim.provider_user_id == current_user.id)
+        .first()
+    )
+    if claim is not None:
+        return task
+
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your task")
 
 
 @router.post("/{task_id}/confirm", response_model=TaskResponse)

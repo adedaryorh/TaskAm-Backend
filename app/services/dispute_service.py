@@ -4,7 +4,7 @@ from fastapi import HTTPException, status
 
 from sqlalchemy.orm import Session
 
-from app.models.base import TaskStatus, DisputeStatus, PaymentStatus
+from app.models.base import TaskStatus, DisputeStatus, PaymentStatus, ClaimStatus
 from app.models.dispute import Dispute
 from app.models.payment import Payment
 from app.models.task import Task
@@ -37,23 +37,32 @@ def resolve_dispute(db: Session, dispute: Dispute, admin_id: uuid.UUID, resoluti
 
     task = db.get(Task, dispute.task_id)
     payment = db.query(Payment).filter(Payment.task_id == task.id).first()
+    # Money only moves when escrow was actually funded; a dispute raised at
+    # CLAIMED (pre-funding) must still be resolvable.
+    has_funded_payment = payment is not None and payment.status == PaymentStatus.FUNDED
 
-    if resolution == "RESOLVED_MERCHANT":
-        # Refund the merchant; task does not complete.
-        from app.services.payment_service import refund_payment
-        refund_payment(db, task)
-        dispute.status = DisputeStatus.RESOLVED_MERCHANT
-        transition_task(db, task, TaskStatus.CANCELLED, actor_user_id=admin_id)
+    try:
+        if resolution == "RESOLVED_MERCHANT":
+            # Refund the merchant; task does not complete.
+            if has_funded_payment:
+                from app.services.payment_service import refund_payment
+                refund_payment(db, task)
+            dispute.status = DisputeStatus.RESOLVED_MERCHANT
+            transition_task(db, task, TaskStatus.CANCELLED, actor_user_id=admin_id)
 
-    elif resolution == "RESOLVED_STUDENT":
-        # Release escrow to the student as if the work were approved.
-        from app.services.payment_service import release_payment
-        release_payment(db, task)
-        dispute.status = DisputeStatus.RESOLVED_STUDENT
-        transition_task(db, task, TaskStatus.COMPLETED, actor_user_id=admin_id)
+        elif resolution == "RESOLVED_STUDENT":
+            # Release escrow to the student as if the work were approved.
+            if has_funded_payment:
+                from app.services.payment_service import release_payment
+                release_payment(db, task)
+            dispute.status = DisputeStatus.RESOLVED_STUDENT
+            transition_task(db, task, TaskStatus.COMPLETED, actor_user_id=admin_id)
 
-    else:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="resolution must be RESOLVED_MERCHANT or RESOLVED_STUDENT")
+        else:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="resolution must be RESOLVED_MERCHANT or RESOLVED_STUDENT")
+    except InvalidTaskTransition as e:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
     dispute.resolution_note = note
     dispute.resolved_by_admin_id = admin_id
@@ -65,7 +74,7 @@ def resolve_dispute(db: Session, dispute: Dispute, admin_id: uuid.UUID, resoluti
 
     merchant = db.get(Merchant, task.merchant_id) if task.merchant_id else None
     requester_id = merchant.user_id if merchant else task.requester_user_id
-    claim = db.query(TaskClaim).filter(TaskClaim.task_id == task.id, TaskClaim.status.in_(["ACTIVE", "COMPLETED"])).first()
+    claim = db.query(TaskClaim).filter(TaskClaim.task_id == task.id, TaskClaim.status.in_([ClaimStatus.ACTIVE, ClaimStatus.COMPLETED])).first()
 
     outcome_text = "in the merchant's favor (refunded)" if resolution == "RESOLVED_MERCHANT" else "in the student's favor (paid out)"
     if requester_id:

@@ -70,7 +70,9 @@ def create_checkout_order(reference: str, amount_naira: float, currency: str = "
 
 
 def verify_webhook_signature(raw_body: bytes, signature_header: str | None) -> bool:
-    if not signature_header:
+    # Fail closed: with no secret configured, an attacker could otherwise
+    # "verify" by signing with the empty key.
+    if not settings.opay_webhook_secret or not signature_header:
         return False
     computed = hmac.new(settings.opay_webhook_secret.encode(), raw_body, hashlib.sha512).hexdigest()
     return hmac.compare_digest(computed, signature_header)

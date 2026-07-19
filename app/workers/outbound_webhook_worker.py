@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 _shutdown = False
 
 
+# How long a claimed row is invisible to other workers. Must exceed the
+# 15s HTTP timeout below.
+_CLAIM_LEASE_SECONDS = 60
+
+
 def _stop(signum, frame):
     global _shutdown
     _shutdown = True
@@ -24,11 +29,19 @@ def _stop(signum, frame):
 def process_batch(limit: int = 50) -> int:
     db = SessionLocal()
     try:
+        # Claim rows with a short lease and commit immediately so row locks
+        # are never held across network I/O. A crashed worker's rows simply
+        # become eligible again when the lease expires.
+        now = datetime.now(timezone.utc)
         rows = db.query(OutboundWebhook).filter(
             OutboundWebhook.delivered.is_(False),
             OutboundWebhook.attempts < settings.outbound_webhook_max_attempts,
-            (OutboundWebhook.next_attempt_at.is_(None) | (OutboundWebhook.next_attempt_at <= datetime.now(timezone.utc))),
+            (OutboundWebhook.next_attempt_at.is_(None) | (OutboundWebhook.next_attempt_at <= now)),
         ).with_for_update(skip_locked=True).limit(limit).all()
+        for row in rows:
+            row.next_attempt_at = now + timedelta(seconds=_CLAIM_LEASE_SECONDS)
+        db.commit()
+
         for row in rows:
             body = json.dumps(row.payload, sort_keys=True, separators=(",", ":")).encode()
             row.attempts += 1
@@ -46,7 +59,7 @@ def process_batch(limit: int = 50) -> int:
             except Exception as exc:
                 row.last_error = str(exc)
                 row.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=min(3600, 5 * (2 ** row.attempts)))
-        db.commit()
+            db.commit()
         return len(rows)
     except Exception:
         db.rollback()

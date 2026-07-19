@@ -1,16 +1,21 @@
+import logging
 import uuid
+from decimal import Decimal, InvalidOperation
 
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.base import TaskStatus, PaymentStatus
+from app.models.base import TaskStatus, PaymentStatus, ClaimStatus
 from app.models.payment import Payment
 from app.models.task import Task
 from app.services import opay_service, paystack_service
 from app.services.task_service import transition_task
 from app.models.task_claim import TaskClaim
 from app.models.user import Student, ProviderProfile
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_PROVIDERS = {"OPAY", "PAYSTACK"}
 
@@ -61,21 +66,43 @@ def initiate_payment(
         status=PaymentStatus.PENDING,
     )
     db.add(payment)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Concurrent initiation raced us past the existence check above;
+        # payments.task_id is unique, so return the row that won.
+        db.rollback()
+        existing = db.query(Payment).filter(Payment.task_id == task.id).first()
+        if existing is not None:
+            return existing
+        raise
     db.refresh(payment)
     return payment
 
 
-def _parse_opay_event(raw_payload: dict) -> tuple[str | None, bool, bool]:
-    """Returns (provider_reference, is_success, is_failure)."""
+def _parse_opay_event(raw_payload: dict) -> tuple[str | None, bool, bool, int | None, str | None]:
+    """Returns (provider_reference, is_success, is_failure, amount_kobo, currency)."""
     reference = raw_payload.get("orderNo") or raw_payload.get("reference")
     event_status = (raw_payload.get("status") or "").upper()
-    return reference, event_status in ("SUCCESS", "SUCCESSFUL", "PAID"), event_status in ("FAILED", "CANCELLED")
+    amount = raw_payload.get("amount")
+    currency = raw_payload.get("currency")
+    if isinstance(amount, dict):  # checkout-style {"total": kobo, "currency": "NGN"}
+        currency = amount.get("currency") or currency
+        amount = amount.get("total")
+    amount_kobo = int(amount) if isinstance(amount, (int, str)) and str(amount).isdigit() else None
+    return (
+        reference,
+        event_status in ("SUCCESS", "SUCCESSFUL", "PAID"),
+        event_status in ("FAILED", "CANCELLED"),
+        amount_kobo,
+        currency,
+    )
 
 
-def _parse_paystack_event(raw_payload: dict) -> tuple[str | None, bool, bool]:
+def _parse_paystack_event(raw_payload: dict) -> tuple[str | None, bool, bool, int | None, str | None]:
     """
-    Paystack webhook shape: {"event": "charge.success", "data": {"reference": ..., "status": "success", ...}}
+    Paystack webhook shape: {"event": "charge.success", "data": {"reference": ..., "status": "success",
+    "amount": <kobo>, "currency": "NGN", ...}}
     """
     data = raw_payload.get("data", {})
     reference = data.get("reference")
@@ -83,7 +110,23 @@ def _parse_paystack_event(raw_payload: dict) -> tuple[str | None, bool, bool]:
     data_status = (data.get("status") or "").lower()
     is_success = event == "charge.success" or data_status == "success"
     is_failure = event in ("charge.failed",) or data_status in ("failed", "abandoned")
-    return reference, is_success, is_failure
+    amount = data.get("amount")
+    amount_kobo = int(amount) if isinstance(amount, (int, str)) and str(amount).isdigit() else None
+    return reference, is_success, is_failure, amount_kobo, data.get("currency")
+
+
+def _amount_matches(payment: Payment, amount_kobo: int | None, currency: str | None) -> bool:
+    """A success event must pay at least the escrow amount, in the right currency.
+    Events that omit the amount are rejected — never fund on trust."""
+    if amount_kobo is None:
+        return False
+    if currency and currency.upper() != (payment.currency or "NGN").upper():
+        return False
+    try:
+        expected_kobo = int(Decimal(str(payment.amount)) * 100)
+    except (InvalidOperation, TypeError):
+        return False
+    return amount_kobo >= expected_kobo
 
 
 def handle_payment_webhook(db: Session, provider: str, raw_payload: dict) -> None:
@@ -93,9 +136,9 @@ def handle_payment_webhook(db: Session, provider: str, raw_payload: dict) -> Non
     (both happen in the router before this is called).
     """
     if provider == "OPAY":
-        provider_reference, is_success, is_failure = _parse_opay_event(raw_payload)
+        provider_reference, is_success, is_failure, amount_kobo, currency = _parse_opay_event(raw_payload)
     elif provider == "PAYSTACK":
-        provider_reference, is_success, is_failure = _parse_paystack_event(raw_payload)
+        provider_reference, is_success, is_failure, amount_kobo, currency = _parse_paystack_event(raw_payload)
     else:
         return
 
@@ -110,20 +153,39 @@ def handle_payment_webhook(db: Session, provider: str, raw_payload: dict) -> Non
     if payment is None:
         return
 
+    # Terminal states never regress: a late "failed" retry must not clobber a
+    # funded/released/refunded payment, and duplicates of "success" are no-ops.
+    if payment.status != PaymentStatus.PENDING:
+        logger.info(
+            "Ignoring %s webhook for payment %s already in state %s",
+            provider, payment.id, payment.status.value,
+        )
+        return
+
     payment.raw_webhook_payload = raw_payload
 
     if is_success:
+        if not _amount_matches(payment, amount_kobo, currency):
+            logger.warning(
+                "Payment %s success event amount/currency mismatch (got %s %s, expected %s %s) — not funding",
+                payment.id, amount_kobo, currency, payment.amount, payment.currency,
+            )
+            payment.settlement_error = f"Webhook amount mismatch: got {amount_kobo} kobo {currency or '?'}"
+            db.commit()
+            return
         payment.status = PaymentStatus.FUNDED
         task = db.get(Task, payment.task_id)
         if task is not None and task.status == TaskStatus.CLAIMED:
             transition_task(db, task, TaskStatus.FUNDED)
             db.commit()
 
-            from app.models.task_claim import TaskClaim
-            from app.models.user import Student
             from app.services.notification_service import notify
 
-            claim = db.query(TaskClaim).filter(TaskClaim.task_id == task.id, TaskClaim.status == "ACTIVE").first()
+            claim = (
+                db.query(TaskClaim)
+                .filter(TaskClaim.task_id == task.id, TaskClaim.status == ClaimStatus.ACTIVE)
+                .first()
+            )
             if claim is not None:
                 notify(
                     db,
@@ -140,14 +202,19 @@ def handle_payment_webhook(db: Session, provider: str, raw_payload: dict) -> Non
 
 
 def release_payment(db: Session, task: Task) -> Payment:
-    if not settings.payment_settlement_enabled:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Payment settlement is disabled")
     payment = db.query(Payment).filter(Payment.task_id == task.id).first()
-    claim = db.query(TaskClaim).filter(TaskClaim.task_id == task.id, TaskClaim.status == "ACTIVE").first()
+    claim = db.query(TaskClaim).filter(TaskClaim.task_id == task.id, TaskClaim.status == ClaimStatus.ACTIVE).first()
     if payment is None or payment.status != PaymentStatus.FUNDED:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Task has no funded payment")
     if claim is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Task has no active claim")
+    if not settings.payment_settlement_enabled:
+        # Don't strand the workflow: complete the claim and flag the payment
+        # for a manual payout instead of failing the whole approval.
+        logger.warning("Settlement disabled — payment %s requires manual payout", payment.id)
+        payment.settlement_error = "Settlement disabled — manual payout required"
+        claim.status = ClaimStatus.COMPLETED
+        return payment
     payout_profile = db.get(Student, claim.student_id) if claim.student_id else db.query(ProviderProfile).filter(
         ProviderProfile.user_id == claim.provider_user_id
     ).first()
@@ -175,16 +242,18 @@ def release_payment(db: Session, task: Task) -> Payment:
     payment.settlement_reference = settlement_reference
     payment.settlement_error = None
     payment.status = PaymentStatus.RELEASED
-    claim.status = "COMPLETED"
+    claim.status = ClaimStatus.COMPLETED
     return payment
 
 
 def refund_payment(db: Session, task: Task) -> Payment:
-    if not settings.payment_settlement_enabled:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Payment settlement is disabled")
     payment = db.query(Payment).filter(Payment.task_id == task.id).first()
     if payment is None or payment.status != PaymentStatus.FUNDED or not payment.provider_reference:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Task has no refundable payment")
+    if not settings.payment_settlement_enabled:
+        logger.warning("Settlement disabled — payment %s requires manual refund", payment.id)
+        payment.settlement_error = "Settlement disabled — manual refund required"
+        return payment
     reference = f"refund-{payment.id}"
     try:
         if payment.provider == "PAYSTACK":

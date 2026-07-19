@@ -1,8 +1,10 @@
+import hashlib
 import logging
 import hmac
 import time
 
 from fastapi import APIRouter, Depends, Query, HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -38,10 +40,33 @@ def verify_whatsapp_webhook(
     return int(challenge) if challenge.isdigit() else challenge
 
 
+def _verify_meta_signature(raw_body: bytes, signature_header: str | None) -> bool:
+    """Verify Meta's X-Hub-Signature-256 header (HMAC-SHA256 of the raw body
+    keyed with the app secret). Rejects everything when no secret is set."""
+    if not settings.whatsapp_app_secret:
+        return False
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    supplied = signature_header.removeprefix("sha256=")
+    expected = hmac.new(
+        settings.whatsapp_app_secret.encode("utf-8"), raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, supplied)
+
+
 @router.post("/whatsapp", status_code=status.HTTP_200_OK)
 async def receive_whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
-    enforce_webhook_rate_limit(request)
+    raw_body = await request.body()
+    if not _verify_meta_signature(raw_body, request.headers.get("x-hub-signature-256")):
+        logger.warning("Rejected WhatsApp webhook with missing/invalid X-Hub-Signature-256")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
     payload = await request.json()
+    # DB/Redis work is synchronous — keep it off the event loop.
+    return await run_in_threadpool(_process_whatsapp_webhook, request, db, payload)
+
+
+def _process_whatsapp_webhook(request: Request, db: Session, payload: dict):
+    enforce_webhook_rate_limit(request)
     messages = whatsapp_client.parse_webhook_payload(payload)
 
     for msg in messages:
@@ -78,7 +103,6 @@ async def receive_whatsapp_webhook(request: Request, db: Session = Depends(get_d
 
 @router.post("/opay", status_code=status.HTTP_200_OK)
 async def receive_opay_webhook(request: Request, db: Session = Depends(get_db)):
-    enforce_webhook_rate_limit(request)
     raw_body = await request.body()
     signature = request.headers.get("signature") or request.headers.get("Signature")
 
@@ -87,6 +111,11 @@ async def receive_opay_webhook(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
 
     payload = await request.json()
+    return await run_in_threadpool(_process_opay_webhook, request, db, payload)
+
+
+def _process_opay_webhook(request: Request, db: Session, payload: dict):
+    enforce_webhook_rate_limit(request)
     external_id = payload.get("orderNo") or payload.get("reference") or payload.get("transactionId")
     if not external_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing order reference")
@@ -107,7 +136,6 @@ async def receive_opay_webhook(request: Request, db: Session = Depends(get_db)):
 
 @router.post("/paystack", status_code=status.HTTP_200_OK)
 async def receive_paystack_webhook(request: Request, db: Session = Depends(get_db)):
-    enforce_webhook_rate_limit(request)
     raw_body = await request.body()
     signature = request.headers.get("x-paystack-signature")
 
@@ -116,6 +144,11 @@ async def receive_paystack_webhook(request: Request, db: Session = Depends(get_d
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid signature")
 
     payload = await request.json()
+    return await run_in_threadpool(_process_paystack_webhook, request, db, payload)
+
+
+def _process_paystack_webhook(request: Request, db: Session, payload: dict):
+    enforce_webhook_rate_limit(request)
     external_id = payload.get("data", {}).get("reference")
     if not external_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing transaction reference")
@@ -136,7 +169,6 @@ async def receive_paystack_webhook(request: Request, db: Session = Depends(get_d
 
 @router.post("/logistics", status_code=status.HTTP_200_OK)
 async def receive_logistics_webhook(request: Request, db: Session = Depends(get_db)):
-    enforce_webhook_rate_limit(request)
     raw_body = await request.body()
     timestamp = request.headers.get("x-logistics-timestamp", "")
     supplied = request.headers.get("x-logistics-signature", "").removeprefix("sha256=")
@@ -150,6 +182,11 @@ async def receive_logistics_webhook(request: Request, db: Session = Depends(get_
     envelope = PlatformEventEnvelope.model_validate_json(raw_body)
     if envelope.source != "logistics" or not envelope.logistics_delivery_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid logistics event envelope")
+    return await run_in_threadpool(_process_logistics_webhook, request, db, envelope)
+
+
+def _process_logistics_webhook(request: Request, db: Session, envelope: PlatformEventEnvelope):
+    enforce_webhook_rate_limit(request)
     is_new = record_webhook_event(db, WebhookSource.LOGISTICS, envelope.event_id, envelope.model_dump(mode="json"))
     if not is_new:
         return {"status": "already processed", "event_id": envelope.event_id}

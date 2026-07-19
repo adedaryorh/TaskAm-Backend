@@ -13,6 +13,10 @@ class Settings(BaseSettings):
 
     # Database
     database_url: str = "postgresql+psycopg://taskam:taskam@localhost:5432/taskam"
+    # Sized for 2 gunicorn workers + 4 background worker processes sharing one
+    # small Postgres; raise together with Postgres max_connections.
+    db_pool_size: int = 5
+    db_max_overflow: int = 5
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
@@ -22,6 +26,12 @@ class Settings(BaseSettings):
     notification_max_attempts: int = 8
     webhook_rate_limit: int = 300
     webhook_rate_window_seconds: int = 60
+    auth_rate_limit: int = 10
+    auth_rate_window_seconds: int = 60
+    # Behind a reverse proxy (Caddy), the TCP peer is always the proxy; enable
+    # this so rate limiting keys on X-Forwarded-For instead. Only turn it on
+    # when the proxy strips/overwrites the header from clients.
+    trust_proxy_headers: bool = False
 
     # Auth
     jwt_secret: str = "change-me-in-production"
@@ -30,6 +40,7 @@ class Settings(BaseSettings):
 
     # WhatsApp Cloud API
     whatsapp_verify_token: str = "change-me"
+    whatsapp_app_secret: str = ""  # Meta app secret, used to verify X-Hub-Signature-256
     whatsapp_access_token: str = ""
     whatsapp_phone_number_id: str = ""
     whatsapp_api_base: str = "https://graph.facebook.com/v20.0"
@@ -94,10 +105,24 @@ class Settings(BaseSettings):
             weak = {"", "change-me", "change-me-in-production"}
             if self.jwt_secret in weak:
                 raise ValueError("JWT_SECRET must be changed in production")
+            if len(self.jwt_secret) < 32:
+                raise ValueError("JWT_SECRET must be at least 32 characters in production")
             if not self.database_url:
                 raise ValueError("DATABASE_URL is required in production")
+            if self.whatsapp_verify_token in weak:
+                raise ValueError("WHATSAPP_VERIFY_TOKEN must be changed in production")
+            # An empty webhook secret makes HMAC verification trivially forgeable
+            # (attacker signs with the empty key) — fail closed at boot instead.
+            if not self.whatsapp_app_secret:
+                raise ValueError("WHATSAPP_APP_SECRET is required in production")
+            if self.default_payment_provider == "OPAY" and not self.opay_webhook_secret:
+                raise ValueError("OPAY_WEBHOOK_SECRET is required in production")
+            if self.default_payment_provider == "PAYSTACK" and not self.paystack_secret_key:
+                raise ValueError("PAYSTACK_SECRET_KEY is required in production")
             if self.farmsense_status_webhook_url and not self.farmsense_outbound_secret:
                 raise ValueError("FARMSENSE_OUTBOUND_SECRET is required when status callbacks are enabled")
+            if self.logistics_service_url and not self.logistics_webhook_secret:
+                raise ValueError("LOGISTICS_WEBHOOK_SECRET is required when logistics integration is enabled")
         return self
 
 

@@ -16,13 +16,15 @@ router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 @router.get("/tasks", response_model=list[TaskResponse])
 def browse_published_tasks(
     service_category: ServiceCategory | None = Query(None),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     current_user: User = Depends(require_roles(UserRole.STUDENT, UserRole.SERVICE_PROVIDER, UserRole.ADMIN)),
     db: Session = Depends(get_db),
 ):
     query = db.query(Task).filter(Task.status == TaskStatus.PUBLISHED)
     if service_category:
         query = query.filter(Task.service_category == service_category)
-    return query.order_by(Task.created_at.desc()).all()
+    return query.order_by(Task.created_at.desc()).offset(offset).limit(limit).all()
 
 
 @router.post("/tasks/{task_id}/claim", response_model=TaskClaimResponse, status_code=201)

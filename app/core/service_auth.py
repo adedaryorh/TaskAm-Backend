@@ -4,6 +4,7 @@ import secrets
 import time
 
 from fastapi import HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.services.queue import get_redis
@@ -67,7 +68,10 @@ async def require_platform_service(request: Request) -> str:
     if not hmac.compare_digest(expected, supplied):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid service authentication")
     replay_key = f"service-auth-nonce:{service}:{nonce}"
-    accepted = get_redis().set(replay_key, "1", nx=True, ex=settings.service_auth_max_skew_seconds)
+    # Sync Redis client — run off the event loop.
+    accepted = await run_in_threadpool(
+        get_redis().set, replay_key, "1", nx=True, ex=settings.service_auth_max_skew_seconds
+    )
     if not accepted:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Replayed service request")
     request.state.platform_service = service

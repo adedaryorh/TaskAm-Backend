@@ -17,9 +17,6 @@ class Payment(Base, UUIDPKMixin, TimestampMixin):
     amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(8), default="NGN")
 
-    # Which gateway processed this payment, and that gateway's own reference
-    # for it. Kept generic (not "opay_order_id") so a task's Payment row
-    # works the same regardless of provider — the provider is just data.
     provider: Mapped[str] = mapped_column(String(20), nullable=False, default="OPAY")  # OPAY | PAYSTACK
     provider_reference: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True)
     checkout_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)

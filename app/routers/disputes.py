@@ -28,9 +28,10 @@ def _assert_party_to_task(db: Session, task: Task, user: User) -> None:
         if merchant is None or task.merchant_id != merchant.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a party to this task")
     elif user.role in (UserRole.STUDENT, UserRole.SERVICE_PROVIDER):
+        from app.models.base import ClaimStatus
         from app.models.task_claim import TaskClaim
 
-        claim = db.query(TaskClaim).filter(TaskClaim.task_id == task.id, TaskClaim.status.in_(["ACTIVE", "COMPLETED"])).first()
+        claim = db.query(TaskClaim).filter(TaskClaim.task_id == task.id, TaskClaim.status.in_([ClaimStatus.ACTIVE, ClaimStatus.COMPLETED])).first()
         if claim is None or claim.provider_user_id != user.id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not a party to this task")
 

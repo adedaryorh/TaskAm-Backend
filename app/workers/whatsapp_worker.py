@@ -78,13 +78,16 @@ def process_whatsapp_message(payload: dict) -> None:
         requirements = text_body
 
         if message_type in ("audio", "voice") and media_id:
-            try:
-                media_url = whatsapp_client.get_media_url(media_id)
-                audio_bytes = whatsapp_client.download_media(media_url)
-                source_audio_key = f"whatsapp-voice-notes/{message_id}.ogg"
-                upload_bytes(source_audio_key, audio_bytes, content_type="audio/ogg")
-            except Exception:
-                logger.exception("Failed to fetch/store voice note for message %s", message_id)
+            # Without the audio there is nothing for the AI to parse — raise so
+            # the queue retries the whole job (media URLs are fetchable for a
+            # while) instead of creating an empty, unparseable DRAFT.
+            media_url = whatsapp_client.get_media_url(media_id)
+            audio_bytes = whatsapp_client.download_media(media_url)
+            source_audio_key = f"whatsapp-voice-notes/{message_id}.ogg"
+            upload_bytes(source_audio_key, audio_bytes, content_type="audio/ogg")
+        elif not (requirements and requirements.strip()):
+            _safe_send(from_wa_id, "We couldn't read that message. Please send your task as text or a voice note.")
+            return
 
         task = create_draft_task_from_whatsapp(
             db,
